@@ -19,9 +19,14 @@ jobs:
         toolchain: stable
         override: true
     
-    - name: Build
-      run: cargo build --release
-    
-    - name: Check
-      run: cargo check
+    - name: Check code compilation
+      run: cargo check --all-targets
+
+    - name: Run Clippy
+      run: cargo clippy -- -D warnings
+
+    # Full build requires Firebird client library
+    # Users should build on systems with Firebird installed
+    # - name: Build
+    #   run: cargo build --release
 

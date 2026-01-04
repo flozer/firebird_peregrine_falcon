@@ -17,7 +17,7 @@
 use std::{
     fs::{create_dir_all, File},
     io::BufWriter,
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
     thread,
     time::Instant,
@@ -58,6 +58,7 @@ pub struct Extractor {
 struct ConnectionPool {
     connections: Arc<ArrayQueue<SimpleConnection>>,
     config: ExtractorConfig,
+    #[allow(dead_code)]
     max_size: usize,
 }
 
@@ -166,12 +167,14 @@ struct PrimaryKeyInfo {
     columns: Vec<String>,
     min_values: Vec<i64>,
     max_values: Vec<i64>,
+    #[allow(dead_code)]
     row_count: i64,
 }
 
 /// Strategy 19: Adaptive Batch Sizing
 struct AdaptiveBatchSizer {
     current_batch_size: usize,
+    #[allow(dead_code)]
     target_memory_mb: f64,
 }
 
@@ -246,7 +249,7 @@ impl Extractor {
         let mut conn = self.pool.acquire()?;
 
         // Detect PK
-        let pk = Self::detect_pk(&mut *conn, table)?;
+        let pk = Self::detect_pk(&mut conn, table)?;
 
         // Strategy 1: Single JOIN query for all column metadata
         let columns_sql = r#"
@@ -278,7 +281,7 @@ impl Extractor {
         }
 
         // Strategy 2: Use MON$ tables for instant row count estimation
-        let row_count = Self::get_row_count_estimate(&mut *conn, table)?;
+        let row_count = Self::get_row_count_estimate(&mut conn, table)?;
 
         let has_blob = columns.iter().any(|c| matches!(c.data_type, DataType::Utf8 if c.is_text_blob));
 
@@ -310,7 +313,7 @@ impl Extractor {
         "#;
 
         let table_upper = table.to_uppercase();
-        match conn.query(&mon_sql, (&table_upper,)) {
+        match conn.query(mon_sql, (&table_upper,)) {
             Ok(results) => {
                 let rows: Vec<(i64,)> = results;
                 if let Some((count,)) = rows.first() {
@@ -353,7 +356,7 @@ impl Extractor {
             ORDER BY seg.rdb$field_position
         "#;
 
-        let pk_cols: Vec<(String,)> = conn.query(&col_sql, (pk_index_name.to_uppercase(),))?;
+        let pk_cols: Vec<(String,)> = conn.query(col_sql, (pk_index_name.to_uppercase(),))?;
         let pk_column_names: Vec<String> = pk_cols
             .iter()
             .map(|(c,)| c.trim().to_string())
@@ -388,7 +391,7 @@ impl Extractor {
         let stats: Vec<(Option<i64>, Option<i64>)> = conn.query(&stats_sql, ())?;
 
         let (min_val, max_val) = stats.first()
-            .and_then(|(min, max)| Some((min.unwrap_or(0), max.unwrap_or(0))))
+            .map(|(min, max)| (min.unwrap_or(0), max.unwrap_or(0)))
             .unwrap_or((0, row_count));
 
         Ok(Some(PrimaryKeyInfo {
@@ -795,7 +798,7 @@ fn format_number(n: i64) -> String {
     let chars: Vec<char> = s.chars().collect();
 
     for (i, ch) in chars.iter().enumerate() {
-        if i > 0 && (chars.len() - i) % 3 == 0 && *ch != '-' {
+        if i > 0 && (chars.len() - i).is_multiple_of(3) && *ch != '-' {
             result.push(',');
         }
         result.push(*ch);
