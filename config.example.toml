@@ -1,0 +1,35 @@
+# Peregrine Falcon Miramar Configuration Example
+# Copy this to config.toml and update with your settings
+
+[database]
+# Path to your Firebird database file
+path = "/path/to/your/database.fdb"
+
+# Firebird credentials
+user = "SYSDBA"
+password = "masterkey"
+
+[output]
+# Output directory for Parquet files
+directory = "/path/to/output"
+
+[performance]
+# Number of parallel workers (default: 2x CPU cores)
+# Recommended: 40-60 for large tables
+parallelism = 40
+
+# Connection pool size (default: parallelism * 2)
+pool_size = 80
+
+# Enable Snappy compression (default: false for speed)
+use_compression = false
+
+[extraction]
+# Specific table to extract (can be overridden via CLI)
+# Leave empty to specify via command line
+table = ""
+
+# Example usage:
+# ./peregrine_falcon_miramar --config config.toml --table MY_TABLE
+# or
+# ./peregrine_falcon_miramar --database db.fdb --out-dir output --table MY_TABLE
