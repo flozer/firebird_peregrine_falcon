@@ -4,6 +4,9 @@
 
 Version 1.0 "Miramar" - Featuring 23 expert-level optimizations from Firebird and Rust masters.
 
+<img width="1280" height="820" alt="image" src="https://github.com/user-attachments/assets/af549767-1c45-4896-b67a-59dcdeff93e2" />
+
+
 ## Overview
 
 Peregrine Falcon Miramar is a high-performance Rust-based extractor designed to export Firebird database tables to Parquet format with **world-class speed**. Built with contributions from Firebird database experts and Rust performance engineers, this version implements cutting-edge optimization strategies.
@@ -180,7 +183,7 @@ RUSTFLAGS="-Cprofile-use=/tmp/pgo-data/merged.profdata" cargo build --release
 
 ## Expert Team
 
-This version was designed and optimized by a mixed team of world-class experts:
+This version is Inspired by their legacy and phenomenal work.:
 
 **Firebird Database Experts**:
 - Jim Starkey (Firebird Architect)
@@ -245,7 +248,7 @@ MIT License - See [LICENSE](LICENSE) file for details.
 
 ## Version History
 
-- **v1.0.0 "Miramar"** (2026-01): Major rewrite with 23 expert optimizations
+- **v1.0.0 "Miramar"** (2026-01): Major rewrite inspired by their legacy and phenomenal work.with 23 expert optimizations
   - 4.5x performance improvement
   - 10x memory reduction
   - Single-writer architecture (no merge)
