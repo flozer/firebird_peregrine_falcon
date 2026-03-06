@@ -87,7 +87,7 @@ impl ConnectionPool {
         builder.db_name(&config.database_path);
         builder.user(&config.user);
         builder.pass(&config.password);
-        builder.charset(charset::UTF_8); // UTF-8 for better text handling
+        builder.charset(charset::ISO_8859_1); // Windows-1252 for Brazilian Portuguese
         builder.dialect(Dialect::D3);    // Dialect 3 for better optimization
 
         let mut conn: SimpleConnection = builder
@@ -234,9 +234,21 @@ impl Extractor {
         let output_path = self.config.out_dir.join(format!("{}.parquet", table_name.to_lowercase()));
 
         // Strategy 18: Hybrid Streaming-Parallel Architecture
-        if meta.pk.is_some() {
-            println!("  Using streaming parallel PK extraction with {} workers", self.config.parallelism);
-            self.extract_streaming_parallel(&meta, &output_path, start)
+        if let Some(pk) = &meta.pk {
+            let pk_columns = &pk.columns;
+            if pk_columns.len() == 1 {
+                // Single-column PK: use parallel extraction
+                println!("  Using streaming parallel PK extraction with {} workers", self.config.parallelism);
+                self.extract_streaming_parallel(&meta, &output_path, start)
+            } else if meta.row_count > 10_000_000 && meta.table_name != "OBRIGACAO_GCL_SETOR" {
+                // Large table with composite PK: use parallel extraction with first column only
+                println!("  Large composite PK table ({} rows) — using parallel extraction with first PK column", meta.row_count);
+                self.extract_streaming_parallel(&meta, &output_path, start)
+            } else {
+                // Composite PK: use sequential extraction for reliability
+                println!("  Composite PK detected ({} columns) — using sequential extraction", pk_columns.len());
+                self.extract_sequential_composite(&meta, &output_path, start)
+            }
         } else {
             println!("  No PK detected — using optimized sequential extraction");
             self.extract_sequential(&meta, &output_path, start)
@@ -335,11 +347,14 @@ impl Extractor {
 
     fn detect_pk(conn: &mut SimpleConnection, table: &str) -> Result<Option<PrimaryKeyInfo>> {
         // Find PK index
+        // Note: rdb$index_type = 0 means ascending index (standard for PKs)
+        // rdb$index_type = 1 means descending index
         let sql = r#"
             SELECT ri.rdb$index_name
             FROM rdb$indices ri
+            JOIN rdb$relation_constraints rc ON ri.rdb$index_name = rc.rdb$index_name
             WHERE ri.rdb$relation_name = ?
-            AND ri.rdb$index_type = 1
+            AND rc.rdb$constraint_type = 'PRIMARY KEY'
         "#;
 
         let indices: Vec<(String,)> = conn.query(sql, (table.to_uppercase(),))?;
@@ -600,6 +615,132 @@ impl Extractor {
         })
     }
 
+    /// Extract table with composite PK using ORDER BY for consistent pagination
+    fn extract_sequential_composite(
+        &self,
+        meta: &TableMetadata,
+        output_path: &Path,
+        start: Instant,
+    ) -> Result<ExtractionStats> {
+        let batch_sizer = AdaptiveBatchSizer::new(meta.row_count, meta.has_blob);
+        let batch_size = batch_sizer.get_batch_size();
+        println!("  Batch size: {}", format_number(batch_size as i64));
+
+        let pk = meta.pk.as_ref().unwrap();
+        let pk_columns = &pk.columns;
+        let order_by_sql = pk_columns.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", ");
+        
+        type RowBatch = Vec<Row>;
+        let (fetch_tx, fetch_rx): (Sender<Option<RowBatch>>, Receiver<Option<RowBatch>>) = bounded(10);
+        let (batch_tx, batch_rx): (Sender<Option<RecordBatch>>, Receiver<Option<RecordBatch>>) = bounded(8);
+
+        let pool_clone = Arc::clone(&self.pool);
+        let columns_sql: String = meta.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ");
+        let table_name = meta.table_name.clone();
+        let page_size = batch_size as i64;
+
+        // Prefetch thread with ORDER BY for consistent results
+        let fetcher = thread::spawn(move || {
+            let mut conn = match pool_clone.acquire() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("  Failed to acquire connection: {}", e);
+                    return;
+                }
+            };
+
+            let mut offset = 0i64;
+            let mut _total_fetched = 0i64;
+            loop {
+                // Use ORDER BY with all PK columns for consistent pagination
+                let page_query = format!(
+                    "SELECT {} FROM {} ORDER BY {} ROWS {} TO {}",
+                    columns_sql, table_name, order_by_sql, offset + 1, offset + page_size
+                );
+                match conn.query(&page_query, ()) {
+                    Ok(rows) => {
+                        let row_count = rows.len();
+                        if rows.is_empty() {
+                            let _ = fetch_tx.send(None);
+                            break;
+                        }
+                        _total_fetched += row_count as i64;
+                        if fetch_tx.send(Some(rows)).is_err() {
+                            break;
+                        }
+                        offset += page_size;
+                    }
+                    Err(e) => {
+                        eprintln!("  Query error at offset {}: {}", offset, e);
+                        let _ = fetch_tx.send(None);
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Writer thread
+        let schema = Arc::clone(&meta.arrow_schema);
+        let props = self.create_optimized_writer_props();
+        let output_path_clone = output_path.to_path_buf();
+
+        let writer_handle = thread::spawn(move || -> Result<()> {
+            let file = File::create(&output_path_clone)?;
+            let buf = BufWriter::with_capacity(256 * 1024 * 1024, file);
+            let mut writer = ArrowWriter::try_new(buf, schema, Some(props))?;
+
+            while let Ok(opt) = batch_rx.recv() {
+                match opt {
+                    Some(batch) => writer.write(&batch)?,
+                    None => break,
+                }
+            }
+            writer.close()?;
+            Ok(())
+        });
+
+        // Process batches
+        let mut total_rows = 0;
+        let meta_clone = meta.clone();
+        while let Ok(Some(rows)) = fetch_rx.recv() {
+            let batch = build_arrow_batch_optimized(&meta_clone, &rows)?;
+            let row_count = batch.num_rows();
+            if batch_tx.send(Some(batch)).is_err() {
+                break;
+            }
+            total_rows += row_count;
+
+            if total_rows % 500_000 == 0 {
+                let elapsed = start.elapsed().as_secs_f64();
+                let rate = total_rows as f64 / elapsed;
+                println!("  Progress: {} rows - {:.0} rows/s", format_number(total_rows as i64), rate);
+            }
+        }
+
+        let _ = batch_tx.send(None);
+        let _ = fetcher.join();
+        writer_handle.join().map_err(|_| anyhow::anyhow!("writer thread panicked"))??;
+
+        let duration = start.elapsed().as_secs_f64();
+        let file_size_mb = std::fs::metadata(output_path)
+            .map(|m| m.len() as f64 / (1024.0 * 1024.0))
+            .unwrap_or(0.0);
+
+        println!(
+            "  ✓ Done: {} rows in {:.1}s ({:.1} MB, {:.0} rows/s)",
+            format_number(total_rows as i64),
+            duration,
+            file_size_mb,
+            total_rows as f64 / duration
+        );
+
+        Ok(ExtractionStats {
+            rows_extracted: total_rows,
+            duration_secs: duration,
+            file_size_mb,
+        })
+    }
+
     /// Strategy 16: Optimized Parquet Writer Properties
     /// Dictionary encoding + V2 pages + large batches
     fn create_optimized_writer_props(&self) -> WriterProperties {
@@ -617,6 +758,8 @@ impl Extractor {
 }
 
 /// Strategy 14: Streaming Partition Extraction (chunks within partition)
+/// For single-column PKs, uses simple range queries
+/// For composite PKs, uses chunked extraction with first column range + ORDER BY
 fn extract_partition_streaming(
     pool: Arc<ConnectionPool>,
     meta: Arc<TableMetadata>,
@@ -626,31 +769,47 @@ fn extract_partition_streaming(
     batch_tx: Sender<Option<RecordBatch>>,
 ) -> Result<()> {
     let mut conn = pool.acquire()?;
-    let pk_col = &meta.pk.as_ref().unwrap().columns[0];
+    let pk = meta.pk.as_ref().unwrap();
+    let pk_columns = &pk.columns;
+    let first_pk_col = &pk_columns[0];
     let columns_sql: String = meta.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ");
+    
+    // Build ORDER BY clause using all PK columns for consistent ordering
+    let order_by_sql = pk_columns.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", ");
 
     let mut current_pk = start_pk;
+    let mut _total_rows_this_partition = 0i64;
 
     // Stream in chunks instead of loading entire partition
     while current_pk <= end_pk {
         let chunk_end = (current_pk + batch_size as i64).min(end_pk);
 
+        // Use ORDER BY with all PK columns for consistent results
+        // This handles both single and composite PKs properly
         let query = format!(
-            "SELECT {} FROM {} WHERE {} >= {} AND {} <= {}",
-            columns_sql, meta.table_name, pk_col, current_pk, pk_col, chunk_end
+            "SELECT {} FROM {} WHERE {} >= {} AND {} <= {} ORDER BY {}",
+            columns_sql, meta.table_name, first_pk_col, current_pk, first_pk_col, chunk_end, order_by_sql
         );
 
         let rows: Vec<Row> = conn.query(&query, ())?;
+        let row_count = rows.len();
+        
         if rows.is_empty() {
-            break;
+            // No more rows in this range, move to next
+            current_pk = chunk_end + 1;
+            continue;
         }
 
+        _total_rows_this_partition += row_count as i64;
+        
         let batch = build_arrow_batch_optimized(&meta, &rows)?;
 
         if batch_tx.send(Some(batch)).is_err() {
             break;  // Writer closed, stop sending
         }
 
+        // If we got fewer rows than expected, we might be at the end of data in this range
+        // Move to next range to avoid infinite loop
         current_pk = chunk_end + 1;
     }
 
